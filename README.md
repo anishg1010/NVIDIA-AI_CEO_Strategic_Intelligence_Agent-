@@ -15,13 +15,13 @@
 ┌─────────────────────────────────────────────────────────────┐
 │                   PROCESSING LAYER                           │
 │  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐  │
-│  │ Clean Text  │→ │ Chunk (400)  │→ │ Embed (MiniLM)     │  │
+│  │ Clean Text  │→ │ Chunk (400)  │→ │ Embed (BAAI/bge base)     │  │
 │  └─────────────┘  └──────────────┘  └────────────────────┘  │
 │  ┌─────────────────────────────────────────────────────────┐ │
 │  │           ChromaDB (cosine similarity)                   │ │
 │  └─────────────────────────────────────────────────────────┘ │
 │  ┌──────────────────────┐                                     │
-│  │ Sentiment (RoBERTa)  │                                     │
+│  │ Sentiment (RoBERTa)  │                                     │          (Finbert)
 │  └──────────────────────┘                                     │
 └─────────────────────────────────────────────────────────────┘
           │
@@ -53,6 +53,111 @@
 │  Sentiment | Recommendations | CEO Briefing | Q&A           │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Data Flow Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        DATA COLLECTION LAYER                          │
+│                         data_collector.py                             │
+│                                                                        │
+│  RSS(8) ─┐                                                             │
+│  Reddit ─┤                                                             │
+│  StockTwits─┤  collect_all()  ──►  relevance filter  ──►  dedup       │
+│  NewsAPI ─┤  (9 collectors)       (35 NVIDIA keywords)  (title+URL)   │
+│  NVIDIA IR─┤                                                           │
+│  HackerNews┤                                                           │
+│  GitHub ──┤                                                            │
+│  Yahoo ───┤                                                            │
+│  Wikipedia┘                                                            │
+└──────────────────────────┬───────────────────────────────────────────┘
+                           │  list[dict]  ~244 articles
+                           ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       PROCESSING LAYER                                │
+│                  knowledge_store.py + sentiment.py                    │
+│                                                                        │
+│  clean_text()     chunk_text()      embed()          ChromaDB         │
+│  strip HTML   ──► 400 chars    ──►  BAAI/bge     ──► cosine sim      │
+│  remove URLs      80 overlap        768-dim          ~3395 chunks     │
+│                                                                        │
+│  sentiment.py (parallel):                                             │
+│  FinBERT (financial sources) ──► positive/neutral/negative + score   │
+│  Twitter-RoBERTa (social)    ──► positive/neutral/negative + score   │
+│  VADER (fallback)            ──► compound score                       │
+└──────────┬───────────────────────────────┬───────────────────────────┘
+           │  3395 chunks stored           │  sentiment on all 244 docs
+           ▼                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                    INTELLIGENCE ENGINE (RAG)                           │
+│                         intel_engine.py                                │
+│                                                                        │
+│  For each category (opportunities / risks / trends):                  │
+│                                                                        │
+│  search query ──► embed query ──► cosine search ──► top-8 chunks     │
+│       │           (768-dim)       ChromaDB            with source      │
+│       │                                ▼                               │
+│       └────────────────────►  build context string                    │
+│                                  [Source N: name | date]              │
+│                                         ▼                              │
+│                              Ollama llama3.1:8b                       │
+│                              temp=0.1, system+user prompt             │
+│                                         ▼                              │
+│                              parse JSON response                       │
+│                              5 items × 3 categories = 15 insights     │
+└──────────────────────────────────┬───────────────────────────────────┘
+                                   │  intelligence dict
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                         AI CEO AGENT                                   │
+│                           ceo_agent.py                                 │
+│                                                                        │
+│  generate_recommendations()  ──► 5 priority-sorted strategic actions  │
+│  generate_ceo_briefing()     ──► 300-word executive summary           │
+│  answer_ceo_question()       ──► live RAG Q&A per question            │
+│                                         ▼                              │
+│                              report.json  (full pipeline output)       │
+└──────────────────────────────────┬───────────────────────────────────┘
+                                   │  report.json
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                   EXECUTIVE INTELLIGENCE DASHBOARD                     │
+│                           dashboard/app.py                             │
+│                           Streamlit + Plotly                           │
+│                         @cache_data(ttl=300)                           │
+│                                                                        │
+│  S1: Overview    │ S2: Market Intel  │ S3: Opportunities              │
+│  244 docs        │ semantic search   │ 5 items, evidence+links        │
+│  3395 chunks     │ ChromaDB query    │ confidence scores              │
+│  39 sources      │ sentiment filter  │                                │
+│──────────────────┼───────────────────┼────────────────────────────── │
+│  S4: Risks       │ S5: Sentiment     │ S6: Recommendations            │
+│  severity table  │ 5.1 News FinBERT  │ priority-sorted                │
+│  category filter │ 5.2 Public RoBERTa│ expected impact                │
+│  evidence links  │ 5.3 Trends chart  │ risk assessment                │
+│──────────────────┼───────────────────┼────────────────────────────── │
+│  S7: CEO Briefing (What/Why/Next) │ CEO Q&A (live RAG per question)  │
+└──────────────────────────────────────────────────────────────────────┘
+                                   ▲
+┌──────────────────────────────────────────────────────────────────────┐
+│                      PIPELINE ORCHESTRATOR                             │
+│                           pipeline.py                                  │
+│                                                                        │
+│  cache check ──► collect ──► sentiment ──► store ──► intel ──► agent  │
+│  --force flag    Step 1       Step 2       Step 3   Step 4   Step 5   │
+└──────────────────────────────────────────────────────────────────────┘
+                                   ▲
+┌──────────────────────────────────────────────────────────────────────┐
+│                          CONFIGURATION                                 │
+│                        config/settings.py                              │
+│           Single source of truth for all hyperparameters              │
+│  LLM_MODEL │ CHUNK_SIZE │ TOP_K_RETRIEVAL │ FINBERT_MODEL │ ...       │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+
 
 ## Project Structure
 
@@ -124,35 +229,47 @@ All tuneable parameters are in `config/settings.py`:
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| LLM | Ollama (llama3.1:8b, local) |
-| Embeddings | sentence-transformers (all-MiniLM-L6-v2) |
-| Vector DB | ChromaDB (cosine similarity, persistent) |
-| Sentiment | HuggingFace Transformers (RoBERTa) |
-| Dashboard | Streamlit + Plotly |
-| Data | RSS (feedparser), Reddit JSON API, NewsAPI |
+| Layer | Technology | Why |
+|---|---|---|
+| LLM | Ollama llama3.1:8b (local) | Open-source, no API costs, 8192-token context |
+| Embeddings | BAAI/bge-base-en-v1.5 (768-dim) | MTEB score 63.6 vs 56.3 for MiniLM |
+| Vector DB | ChromaDB (cosine similarity, persistent) | Local, persistent across runs, fast cosine search |
+| Sentiment (financial) | ProsusAI/FinBERT | Trained on Reuters financial news |
+| Sentiment (social) | Cardiff NLP Twitter-RoBERTa | Trained on 124M tweets |
+| Sentiment (fallback) | VADER | Rule-based, offline, no download needed |
+| Dashboard | Streamlit + Plotly | Rapid prototyping, interactive charts |
+| Data sources | RSS, Reddit API, NewsAPI, HackerNews Algolia, StockTwits | Real-time, diverse, free |
+
 
 ## AI Pipeline (RAG Flow)
 
 ```
-User query / analysis task
-      │
-      ▼
- Embed query (SentenceTransformer)
-      │
-      ▼
- ChromaDB similarity search → top-k chunks
-      │
-      ▼
- Build context string (chunk + source + date)
-      │
-      ▼
- Ollama LLM (system prompt + context + task)
-      │
-      ▼
- Parse JSON response → structured output
-      │
-      ▼
- Display in dashboard
+CEO question or intelligence task
+          │
+          ▼
+ Embed query → 768-dim vector
+   (BAAI/bge-base-en-v1.5)
+          │
+          ▼
+ ChromaDB cosine similarity search
+   top-8 chunks from ~3395 stored
+          │
+          ▼
+ Build context string
+   [Source N: name | date]\ntext
+          │
+          ▼
+ Ollama llama3.1:8b
+   system prompt + context + task
+   temperature=0.1 (near-deterministic)
+          │
+          ▼
+ Parse JSON response
+   structured output: title, description,
+   confidence_score, evidence[], category
+          │
+          ▼
+ Display in dashboard with evidence links
+```
+
 ```

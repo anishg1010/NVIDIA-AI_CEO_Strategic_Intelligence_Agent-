@@ -60,7 +60,17 @@ def run_pipeline(force_recollect: bool = False) -> dict:
     # ── STEP 2: Build metadata for dashboard ────────────
     if fresh_run and documents:
         sent_summary   = sentiment_summary(documents)
-        # FIX: store ALL doc metadata (not just 50) for richer sentiment charts
+
+        # ── Filter trend_series to last 30 days only ──────
+        # Prevents 2022-2023 stale articles from inflating volatility
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        if "trend_series" in sent_summary:
+            sent_summary["trend_series"] = [
+                p for p in sent_summary["trend_series"]
+                if p.get("date", "") >= cutoff
+            ]
+
         documents_meta = [
             {
                 "title":           d["title"],
